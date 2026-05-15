@@ -17,6 +17,7 @@ voice-input - 实时语音输入工具
 """
 
 import argparse
+import ast
 import json
 import os
 import struct
@@ -84,6 +85,32 @@ def _find_mic_source():
     return None
 
 
+def _apply_mic_gain(source):
+    """将配置中的 mic_gain 应用到音频源"""
+    config = get_config()
+    gain = config.get("mic_gain", 20)
+    try:
+        subprocess.run(["pactl", "set-source-volume", source, f"{gain}%"],
+                      capture_output=True, timeout=3)
+    except Exception:
+        pass
+
+
+def _redirect_stderr():
+    """在 OS 层面将 fd 2 重定向到 /dev/null。返回旧的 fd 副本。"""
+    devnull = os.open(os.devnull, os.O_WRONLY)
+    old = os.dup(2)
+    os.dup2(devnull, 2)
+    os.close(devnull)
+    return old
+
+
+def _restore_stderr(old):
+    """恢复 fd 2"""
+    os.dup2(old, 2)
+    os.close(old)
+
+
 def notify(title, msg, icon="audio-input-microphone"):
     try:
         subprocess.run(["notify-send", "-i", icon, "-t", "1500", title, msg],
@@ -107,26 +134,13 @@ def paste_text(text):
     if not text:
         return
 
-    # 1. ydotool type — 通过 ydotoold 守护进程输入（Wayland/X11 均可用）
-    try:
-        time.sleep(0.1)
-        r = subprocess.run(["ydotool", "type", text], capture_output=True, timeout=8)
-        if r.returncode == 0:
-            return
-    except Exception:
-        pass
-
-    # 2. wtype — Wayland 原生文本输入
-    try:
-        time.sleep(0.1)
-        r = subprocess.run(["wtype", "--", text], capture_output=True, timeout=8)
-        if r.returncode == 0:
-            return
-    except Exception:
-        pass
-
-    # 3. 剪贴板 + Ctrl+V 兜底
+    # 先复制到剪贴板（快）
     clip(text)
+
+    # 等待焦点窗口恢复
+    time.sleep(0.3)
+
+    # 1. 剪贴板 + Ctrl+V 粘贴（快，不怕长文本）
     try:
         r = subprocess.run(["ydotool", "key", "ctrl+v"], capture_output=True, timeout=5)
         if r.returncode == 0:
@@ -134,25 +148,37 @@ def paste_text(text):
     except Exception:
         pass
 
-    # 4. 最终兜底
+    # 2. ydotool type — 逐字输入（较慢但也能用）
+    try:
+        r = subprocess.run(["ydotool", "type", text], capture_output=True, timeout=10)
+        if r.returncode == 0:
+            return
+    except Exception:
+        pass
+
+    # 3. 兜底：剪贴板已有文字，用户手动 Ctrl+V
     notify("📋 已复制到剪贴板", text[:50], "edit-paste")
 
 
 def beep(freq=800, dur=0.08):
     try:
         import numpy as np
-        import pyaudio
-        n = int(RATE * dur)
-        t = np.linspace(0, dur, n, endpoint=False)
-        fade = np.ones(n)
-        fade[:n//10] = np.linspace(0, 1, n//10)
-        fade[-n//10:] = np.linspace(1, 0, n//10)
-        s = (np.sin(2*np.pi*freq*t) * 0.3 * fade).astype(np.float32)
-        p = pyaudio.PyAudio()
-        st = p.open(format=pyaudio.paFloat32, channels=1, rate=RATE, output=True)
-        st.write((s*32767).astype(np.int16).tobytes())
-        st.close()
-        p.terminate()
+        old = _redirect_stderr()
+        try:
+            import pyaudio
+            n = int(RATE * dur)
+            t = np.linspace(0, dur, n, endpoint=False)
+            fade = np.ones(n)
+            fade[:n//10] = np.linspace(0, 1, n//10)
+            fade[-n//10:] = np.linspace(1, 0, n//10)
+            s = (np.sin(2*np.pi*freq*t) * 0.3 * fade).astype(np.float32)
+            p = pyaudio.PyAudio()
+            st = p.open(format=pyaudio.paFloat32, channels=1, rate=RATE, output=True)
+            st.write((s*32767).astype(np.int16).tobytes())
+            st.close()
+            p.terminate()
+        finally:
+            _restore_stderr(old)
     except Exception:
         pass
 
@@ -175,7 +201,11 @@ class VoskEngine:
             return False
         try:
             import vosk
-            self.model = vosk.Model(str(VOSK_MODEL_PATH))
+            old = _redirect_stderr()
+            try:
+                self.model = vosk.Model(str(VOSK_MODEL_PATH))
+            finally:
+                _restore_stderr(old)
             return self.reset()
         except Exception as e:
             notify("❌ Vosk 加载失败", str(e), "dialog-error")
@@ -214,6 +244,38 @@ class VoskEngine:
                 return r.get("text", "")
             except Exception:
                 return ""
+
+
+class FasterWhisperEngine:
+    """faster-whisper 服务器 — 本地高精度中文识别"""
+
+    def __init__(self, server_url="https://127.0.0.1:8765"):
+        self.server_url = server_url
+
+    def transcribe(self, wav_path):
+        import urllib.request
+        import ssl
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        try:
+            with open(wav_path, "rb") as f:
+                audio = f.read()
+            boundary = "----VoiceInput"
+            body = (b"--" + boundary.encode() + b"\r\n"
+                    b'Content-Disposition: form-data; name="audio"; filename="rec.wav"\r\n'
+                    b"Content-Type: audio/wav\r\n\r\n"
+                    + audio + b"\r\n--" + boundary.encode() + b"--\r\n")
+            req = urllib.request.Request(
+                self.server_url + "/transcribe",
+                data=body,
+                headers={"Content-Type": "multipart/form-data; boundary=" + boundary})
+            resp = urllib.request.urlopen(req, timeout=3, context=ctx)
+            data = json.loads(resp.read())
+            return data.get("text", "")
+        except Exception as e:
+            notify("❌ Whisper 服务器错误", str(e)[:80], "dialog-error")
+            return ""
 
 
 class GoogleEngine:
@@ -276,6 +338,7 @@ def record_audio_batch(source):
         source = _find_mic_source()
     if not source:
         return None
+    _apply_mic_gain(source)
 
     vad = webrtcvad.Vad(2)
     rate = RATE
@@ -283,8 +346,9 @@ def record_audio_batch(source):
 
     cmd = ["pw-record", "--target=" + source, "--format=s16",
            "--channels=1", "--rate=" + str(rate), "-"]
+    env = {**os.environ, "PIPEWIRE_DEBUG": "0", "JACK_NO_START_SERVER": "1"}
     try:
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env)
     except Exception as e:
         notify("❌ 录音失败", str(e), "dialog-error")
         return None
@@ -293,8 +357,9 @@ def record_audio_batch(source):
 
     max_rec = 12
     min_rec = 0.5
-    silence_to = 1.2
+    silence_to = 0.6
     in_speech = False
+    had_speech = False
     speech_end = None
     speech_frames = 0
     silence_frames = 0
@@ -334,6 +399,7 @@ def record_audio_batch(source):
                 silence_frames = 0
                 if speech_frames >= VAD_HYSTERESIS and not in_speech:
                     in_speech = True
+                    had_speech = True
                     speech_end = None
             else:
                 silence_frames += 1
@@ -361,6 +427,8 @@ def record_audio_batch(source):
     except Exception:
         proc.kill()
 
+    if not had_speech:
+        return None
     if len(all_audio) < rate * 0.3 * 2:  # 录音太短
         return None
 
@@ -388,6 +456,7 @@ def record_recognize(engine, source):
         source = _find_mic_source()
     if not source:
         return "", []
+    _apply_mic_gain(source)
 
     vad = webrtcvad.Vad(3)  # 模式 3（高精度，避免环境噪音误判）
     rate = RATE
@@ -397,8 +466,9 @@ def record_recognize(engine, source):
     # 启动录音（stdout 输出 raw PCM）
     cmd = ["pw-record", "--target=" + source, "--format=s16",
            "--channels=1", "--rate=" + str(rate), "-"]
+    env = {**os.environ, "PIPEWIRE_DEBUG": "0", "JACK_NO_START_SERVER": "1"}
     try:
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env)
     except Exception as e:
         notify("❌ 录音失败", str(e), "dialog-error")
         return "", []
@@ -522,7 +592,8 @@ def record_recognize(engine, source):
 
 class VoiceDaemon:
     def __init__(self):
-        self.engine = VoskEngine()
+        self.vosk_engine = VoskEngine()
+        self.whisper_engine = None
         self.running = False
         self._recording = False
         self._fifo_path = Path("/tmp/voice-input.fifo")
@@ -550,18 +621,21 @@ class VoiceDaemon:
         self._pid_file.write_text(str(os.getpid()))
 
         config = get_config()
-        try:
-            source = _find_mic_source()
-            if source:
-                gain = str(config.get("mic_gain", 20)) + "%"
-                subprocess.run(["pactl", "set-source-volume", source, gain],
-                             capture_output=True, timeout=3)
-        except Exception:
-            pass
+        engine_name = config.get("engine", "vosk")
+        source = _find_mic_source()
+        if source:
+            _apply_mic_gain(source)
 
-        print("🎙️  加载 Vosk 模型...")
-        if not self.engine.load():
-            return
+        if engine_name == "whisper":
+            model_name = config.get("whisper_model", "small")
+            print(f"🎙️  加载 Whisper {model_name} 模型...")
+            self.whisper_engine = WhisperEngine(model_name)
+            if not self.whisper_engine.load():
+                return
+        elif engine_name == "vosk":
+            print("🎙️  加载 Vosk 模型...")
+            if not self.vosk_engine.load():
+                return
 
         self.running = True
 
@@ -622,6 +696,7 @@ class VoiceDaemon:
 
     def _do_record(self):
         config = get_config()
+        engine_name = config.get("engine", "vosk")
         do_beep = config.get("beep", True)
         do_input = config.get("auto_input", True)
         if do_beep:
@@ -632,12 +707,48 @@ class VoiceDaemon:
             return
 
         notify("🎤 请说话...", "说完自动识别", "audio-input-microphone")
-        self.engine.reset()
 
-        text, partials = record_recognize(self.engine, source)
-
-        if do_beep:
-            beep(660)
+        text = ""
+        if engine_name == "google":
+            wav_path = record_audio_batch(source)
+            if do_beep:
+                beep(660)
+            if not wav_path:
+                notify("⚠️ 未检测到语音", "请再试一次", "dialog-warning")
+                return
+            engine = GoogleEngine()
+            text = engine.transcribe(wav_path)
+            os.unlink(wav_path)
+        elif engine_name == "faster-whisper":
+            wav_path = record_audio_batch(source)
+            if do_beep:
+                beep(660)
+            if not wav_path:
+                notify("⚠️ 未检测到语音", "请再试一次", "dialog-warning")
+                return
+            engine = FasterWhisperEngine()
+            text = engine.transcribe(wav_path)
+            os.unlink(wav_path)
+        elif engine_name == "whisper":
+            wav_path = record_audio_batch(source)
+            if do_beep:
+                beep(660)
+            if not wav_path:
+                notify("⚠️ 未检测到语音", "请再试一次", "dialog-warning")
+                return
+            if self.whisper_engine is None:
+                model = config.get("whisper_model", "small")
+                self.whisper_engine = WhisperEngine(model)
+                if not self.whisper_engine.load():
+                    return
+            text = self.whisper_engine.transcribe(wav_path)
+            os.unlink(wav_path)
+        else:
+            # vosk 流式识别
+            self.vosk_engine.reset()
+            text, _ = record_recognize(self.vosk_engine, source)
+            if do_beep:
+                beep(660)
 
         if text:
             if do_input:
@@ -667,7 +778,8 @@ def test_mic():
 
     cmd = ["pw-record", "--target=" + source, "--format=s16",
            "--channels=1", "--rate=" + str(rate), "-"]
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    env = {**os.environ, "PIPEWIRE_DEBUG": "0", "JACK_NO_START_SERVER": "1"}
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env)
     time.sleep(0.3)
 
     print("   录音中，请说话...(按 Ctrl+C 停止)")
@@ -751,7 +863,6 @@ def remove_hotkey():
         bindings = []
         if existing and existing != "@as []":
             try:
-                import ast
                 bindings = [b for b in ast.literal_eval(existing) if b != path]
             except Exception:
                 pass
@@ -789,20 +900,22 @@ def interactive_config():
     print("=" * 40)
 
     # 引擎选择
-    engines = {"1": "vosk", "2": "google", "3": "whisper"}
-    engine_names = {"vosk": "Vosk（本地，离线）", "google": "Google（在线，准确）", "whisper": "Whisper（本地，离线）"}
+    engines = {"1": "vosk", "2": "google", "3": "whisper", "4": "faster-whisper"}
+    engine_names = {"vosk": "Vosk（本地流式）", "google": "Google（在线）",
+                    "whisper": "Whisper（本地离线）", "faster-whisper": "Faster-Whisper（本地服务器）"}
     current = config.get("engine", "vosk")
     print(f"\n当前引擎: {engine_names.get(current, current)}")
-    print("  1) Vosk — 本地流式识别")
+    print("  1) Vosk — 本地流式实时识别")
     print("  2) Google — 在线 Web Speech API（推荐）")
     print("  3) Whisper — 本地离线 OpenAI Whisper")
-    choice = input("选择引擎 [1/2/3，回车跳过]: ").strip()
+    print("  4) Faster-Whisper — 本地 faster-whisper 服务器")
+    choice = input("选择引擎 [1/2/3/4，回车跳过]: ").strip()
     if choice in engines:
         config["engine"] = engines[choice]
         print(f"  ✅ 已设为 {engine_names[engines[choice]]}")
 
     # Whisper 模型
-    if config.get("engine") == "whisper":
+    if config.get("engine") in ("whisper", "faster-whisper"):
         models = ["tiny", "small", "medium", "large"]
         current_model = config.get("whisper_model", "small")
         print(f"\n当前 Whisper 模型: {current_model}")
@@ -901,6 +1014,34 @@ def oneshot():
             notify("⚠️ 未识别到语音", "请再试一次", "dialog-warning")
         return
 
+    if cfg_engine == "faster-whisper":
+        source = _find_mic_source()
+        if not source:
+            print("❌ 未找到麦克风")
+            return
+        if do_beep:
+            beep(880)
+        print("🎤 请说话...")
+        notify("🎤 请说话...", "说完自动识别", "audio-input-microphone")
+        wav_path = record_audio_batch(source)
+        if do_beep:
+            beep(660)
+        if not wav_path:
+            print("⚠️ 未检测到语音")
+            return
+        print("🔍 识别中 (Whisper medium)...")
+        engine = FasterWhisperEngine()
+        text = engine.transcribe(wav_path)
+        os.unlink(wav_path)
+        if text:
+            print(f"📝 {text}")
+            if do_input:
+                paste_text(text)
+            notify("✅ 已输入", text[:60], "dialog-positive")
+        else:
+            notify("⚠️ 未识别到语音", "请再试一次", "dialog-warning")
+        return
+
     if cfg_engine == "whisper":
         source = _find_mic_source()
         if not source:
@@ -986,18 +1127,11 @@ def main():
         if src:
             subprocess.run(["pactl", "set-source-volume", src, f"{g}%"],
                          capture_output=True, timeout=3)
-            cfg = Path.home() / ".config" / "voice-input"
-            cfg.mkdir(parents=True, exist_ok=True)
-            import json
-            cf = cfg / "config.json"
-            c = {}
-            if cf.exists():
-                try: c = json.loads(cf.read_text())
-                except: pass
-            c["mic_gain"] = g
-            cf.write_text(json.dumps(c, indent=2))
+            config = get_config()
+            config["mic_gain"] = g
+            CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+            CONFIG_FILE.write_text(json.dumps(config, indent=2, ensure_ascii=False))
             print(f"✅ 麦克风增益设为 {g}%")
-            print(f"   永久保存到 {cf}")
         else:
             print("❌ 未找到麦克风")
 
@@ -1035,5 +1169,4 @@ def main():
 
 
 if __name__ == "__main__":
-    import ast
     main()
