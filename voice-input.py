@@ -174,7 +174,10 @@ def beep(freq=800, dur=0.08):
             s = (np.sin(2*np.pi*freq*t) * 0.3 * fade).astype(np.float32)
             p = pyaudio.PyAudio()
             st = p.open(format=pyaudio.paFloat32, channels=1, rate=RATE, output=True)
-            st.write((s*32767).astype(np.int16).tobytes())
+            data = (s*32767).astype(np.int16).tobytes()
+            st.write(data)
+            # 等待硬件缓冲区播放完毕，避免 p.terminate() 产生电流声
+            time.sleep(dur + 0.05)
             st.close()
             p.terminate()
         finally:
@@ -246,36 +249,46 @@ class VoskEngine:
                 return ""
 
 
-class FasterWhisperEngine:
-    """faster-whisper 服务器 — 本地高精度中文识别"""
+FASTER_WHISPER_MODEL_DIR = os.path.expanduser("~/.local/share/faster-whisper/models")
 
-    def __init__(self, server_url="https://127.0.0.1:8765"):
-        self.server_url = server_url
+
+class FasterWhisperEngine:
+    """faster-whisper 本地引擎 — CTranslate2 后端，CPU 上比 openai-whisper 快 4x"""
+
+    def __init__(self, model_name="small"):
+        self.model_name = model_name
+        self.model = None
+
+    def _model_path(self):
+        return os.path.join(FASTER_WHISPER_MODEL_DIR, self.model_name)
+
+    def load(self):
+        if self.model is not None:
+            return True
+        try:
+            from faster_whisper import WhisperModel
+            local = self._model_path()
+            if os.path.exists(local) and os.path.exists(os.path.join(local, "model.bin")):
+                self.model = WhisperModel(
+                    local, device="cpu", compute_type="int8",
+                    num_workers=2, cpu_threads=4, local_files_only=True)
+            else:
+                self.model = WhisperModel(
+                    self.model_name, device="cpu", compute_type="int8",
+                    num_workers=2, cpu_threads=4)
+            return True
+        except ImportError:
+            notify("⚠️ faster-whisper 未安装", "pip install faster-whisper", "dialog-error")
+            return False
+        except Exception as e:
+            notify("❌ Faster-Whisper 加载失败", str(e)[:80], "dialog-error")
+            return False
 
     def transcribe(self, wav_path):
-        import urllib.request
-        import ssl
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-        try:
-            with open(wav_path, "rb") as f:
-                audio = f.read()
-            boundary = "----VoiceInput"
-            body = (b"--" + boundary.encode() + b"\r\n"
-                    b'Content-Disposition: form-data; name="audio"; filename="rec.wav"\r\n'
-                    b"Content-Type: audio/wav\r\n\r\n"
-                    + audio + b"\r\n--" + boundary.encode() + b"--\r\n")
-            req = urllib.request.Request(
-                self.server_url + "/transcribe",
-                data=body,
-                headers={"Content-Type": "multipart/form-data; boundary=" + boundary})
-            resp = urllib.request.urlopen(req, timeout=3, context=ctx)
-            data = json.loads(resp.read())
-            return data.get("text", "")
-        except Exception as e:
-            notify("❌ Whisper 服务器错误", str(e)[:80], "dialog-error")
+        if not self.model:
             return ""
+        segments, _ = self.model.transcribe(wav_path, language="zh", beam_size=5)
+        return "".join(seg.text for seg in segments).strip()
 
 
 class GoogleEngine:
@@ -594,6 +607,7 @@ class VoiceDaemon:
     def __init__(self):
         self.vosk_engine = VoskEngine()
         self.whisper_engine = None
+        self.faster_whisper_engine = None
         self.running = False
         self._recording = False
         self._fifo_path = Path("/tmp/voice-input.fifo")
@@ -626,7 +640,13 @@ class VoiceDaemon:
         if source:
             _apply_mic_gain(source)
 
-        if engine_name == "whisper":
+        if engine_name == "faster-whisper":
+            model_name = config.get("whisper_model", "small")
+            print(f"🎙️  加载 Faster-Whisper {model_name} 模型...")
+            self.faster_whisper_engine = FasterWhisperEngine(model_name)
+            if not self.faster_whisper_engine.load():
+                return
+        elif engine_name == "whisper":
             model_name = config.get("whisper_model", "small")
             print(f"🎙️  加载 Whisper {model_name} 模型...")
             self.whisper_engine = WhisperEngine(model_name)
@@ -726,8 +746,12 @@ class VoiceDaemon:
             if not wav_path:
                 notify("⚠️ 未检测到语音", "请再试一次", "dialog-warning")
                 return
-            engine = FasterWhisperEngine()
-            text = engine.transcribe(wav_path)
+            if self.faster_whisper_engine is None:
+                model = config.get("whisper_model", "small")
+                self.faster_whisper_engine = FasterWhisperEngine(model)
+                if not self.faster_whisper_engine.load():
+                    return
+            text = self.faster_whisper_engine.transcribe(wav_path)
             os.unlink(wav_path)
         elif engine_name == "whisper":
             wav_path = record_audio_batch(source)
@@ -902,7 +926,7 @@ def interactive_config():
     # 引擎选择
     engines = {"1": "vosk", "2": "google", "3": "whisper", "4": "faster-whisper"}
     engine_names = {"vosk": "Vosk（本地流式）", "google": "Google（在线）",
-                    "whisper": "Whisper（本地离线）", "faster-whisper": "Faster-Whisper（本地服务器）"}
+                    "whisper": "Whisper（本地离线）", "faster-whisper": "Faster-Whisper（本地，CPU快4x）"}
     current = config.get("engine", "vosk")
     print(f"\n当前引擎: {engine_names.get(current, current)}")
     print("  1) Vosk — 本地流式实时识别")
@@ -1019,6 +1043,11 @@ def oneshot():
         if not source:
             print("❌ 未找到麦克风")
             return
+        model = config.get("whisper_model", "small")
+        engine = FasterWhisperEngine(model)
+        print(f"🔍 加载 Faster-Whisper {model} 模型...")
+        if not engine.load():
+            return
         if do_beep:
             beep(880)
         print("🎤 请说话...")
@@ -1029,8 +1058,7 @@ def oneshot():
         if not wav_path:
             print("⚠️ 未检测到语音")
             return
-        print("🔍 识别中 (Whisper medium)...")
-        engine = FasterWhisperEngine()
+        print("🔍 识别中...")
         text = engine.transcribe(wav_path)
         os.unlink(wav_path)
         if text:
