@@ -1,19 +1,15 @@
 #!/usr/bin/env python3
 """
-voice-input - 实时语音输入工具
-================================
-像豆包/Gemini一样，一边说话一边出字。
-
-架构：
-  - WebRTC VAD — 高精度静音检测
-  - Vosk — 本地流式实时识别（即时显示）  
-  - Google API — 后台准确识别（最终结果）
-  - ydotool type — 直接打字到焦点窗口
+voice-input - 按住说话语音输入工具
+===================================
+按住 Ctrl+Space 说话，松开自动识别并输入文字。
+Wayland/X11 通用（基于 evdev 键盘轮询）。
 
 用法:
   voice-input.py              # 启动守护进程
+  voice-input.py --oneshot    # 单次录音识别
   voice-input.py --test       # 测试麦克风
-  voice-input.py --trigger    # 发送录音信号
+  voice-input.py --config     # 交互式配置
 """
 
 import argparse
@@ -340,9 +336,10 @@ class WhisperEngine:
 # 核心：录音 + 识别 + VAD
 # ============================================================
 
-def record_audio_batch(source):
+def record_audio_batch(source, stop_fn=None):
     """
     录音到临时 WAV 文件，VAD 静音检测自动停止。
+    stop_fn: 可选回调，返回 True 时立即停止录音。
     返回 WAV 文件路径，或 None。
     """
     import webrtcvad
@@ -384,6 +381,8 @@ def record_audio_batch(source):
     while True:
         elapsed = time.time() - start
         if elapsed >= max_rec:
+            break
+        if stop_fn is not None and elapsed >= min_rec and stop_fn():
             break
 
         try:
@@ -610,21 +609,9 @@ class VoiceDaemon:
         self.faster_whisper_engine = None
         self.running = False
         self._recording = False
+        self._stop_requested = False
         self._fifo_path = Path("/tmp/voice-input.fifo")
         self._pid_file = Path("/tmp/voice-input-daemon.pid")
-
-    @staticmethod
-    def _parse_hotkey(hotkey_str):
-        """将 '<Ctrl>space' 转为 pynput 格式 '<ctrl>+<space>'"""
-        import re
-        parts = re.findall(r'<([^>]+)>', hotkey_str)
-        if not parts:
-            return "<ctrl>+<space>"
-        modifiers = "+".join(f"<{p.lower()}>" for p in parts)
-        main = re.sub(r"<[^>]+>", "", hotkey_str).strip()
-        if main:
-            return f"{modifiers}+<{main}>"
-        return f"{modifiers}+<space>"
 
     def start(self):
         if self._pid_file.exists():
@@ -659,32 +646,19 @@ class VoiceDaemon:
 
         self.running = True
 
-        # FIFO（保留作为备用触发通道）
+        # FIFO 接收 GNOME 快捷键触发信号
         self._fifo_path.unlink(missing_ok=True)
         os.mkfifo(self._fifo_path)
         threading.Thread(target=self._fifo_loop, daemon=True).start()
 
-        # pynput 全局热键监听
-        hotkey_str = self._parse_hotkey(config.get("hotkey", "<Ctrl>space"))
-        try:
-            from pynput import keyboard
-            self._hotkey_listener = keyboard.GlobalHotKeys({hotkey_str: self._on_hotkey_press})
-            self._hotkey_listener.start()
-        except Exception as e:
-            notify("⚠️ 无法注册全局热键", str(e)[:80], "dialog-error")
-            print(f"⚠️ 全局热键失败: {e}")
-
-        notify("🎙️ 语音输入已就绪", f"按 {config.get('hotkey', 'Ctrl+Space')} 说话")
-        print(f"✅ 就绪！按 {config.get('hotkey', 'Ctrl+Space')}")
-        print(f"   热键解析为: {hotkey_str}")
+        print("✅ 就绪！Ctrl+Space 开始录音，说完自动停止")
+        notify("🎙️ 语音输入已就绪", "Ctrl+Space 开始，说完自动停止")
 
         try:
-            self._hotkey_listener.join()
-        except KeyboardInterrupt:
-            pass
-        except Exception:
             while self.running:
                 time.sleep(1)
+        except KeyboardInterrupt:
+            pass
         finally:
             self.running = False
             self._fifo_path.unlink(missing_ok=True)
@@ -696,19 +670,23 @@ class VoiceDaemon:
                 with open(self._fifo_path, "r") as f:
                     cmd = f.read().strip()
                     if cmd == "record":
-                        threading.Thread(target=self._on_record, daemon=True).start()
+                        threading.Thread(target=self._on_trigger, daemon=True).start()
             except Exception:
                 time.sleep(0.1)
 
-    def _on_hotkey_press(self):
+    def _on_trigger(self):
         if self._recording:
-            return
-        threading.Thread(target=self._on_record, daemon=True).start()
+            # 正在录音 → 手动停止
+            self._stop_requested = True
+        else:
+            # 未录音 → 开始录音
+            threading.Thread(target=self._on_record, daemon=True).start()
 
     def _on_record(self):
         if self._recording:
             return
         self._recording = True
+        self._stop_requested = False
         try:
             self._do_record()
         finally:
@@ -726,11 +704,13 @@ class VoiceDaemon:
             notify("❌ 未找到麦克风", "", "dialog-error")
             return
 
-        notify("🎤 请说话...", "说完自动识别", "audio-input-microphone")
+        notify("🎤 录音中...", "说完自动停止，或 Ctrl+Space 手动停止", "audio-input-microphone")
+
+        stop_fn = lambda: self._stop_requested
 
         text = ""
         if engine_name == "google":
-            wav_path = record_audio_batch(source)
+            wav_path = record_audio_batch(source, stop_fn=stop_fn)
             if do_beep:
                 beep(660)
             if not wav_path:
@@ -740,7 +720,7 @@ class VoiceDaemon:
             text = engine.transcribe(wav_path)
             os.unlink(wav_path)
         elif engine_name == "faster-whisper":
-            wav_path = record_audio_batch(source)
+            wav_path = record_audio_batch(source, stop_fn=stop_fn)
             if do_beep:
                 beep(660)
             if not wav_path:
@@ -754,7 +734,7 @@ class VoiceDaemon:
             text = self.faster_whisper_engine.transcribe(wav_path)
             os.unlink(wav_path)
         elif engine_name == "whisper":
-            wav_path = record_audio_batch(source)
+            wav_path = record_audio_batch(source, stop_fn=stop_fn)
             if do_beep:
                 beep(660)
             if not wav_path:
@@ -1181,10 +1161,6 @@ def main():
         oneshot()
     elif args.trigger:
         fifo = Path("/tmp/voice-input.fifo")
-        if not fifo.exists():
-            subprocess.Popen([sys.executable, os.path.abspath(__file__)],
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            time.sleep(1)
         if fifo.exists():
             try:
                 fd = os.open(str(fifo), os.O_WRONLY | os.O_NONBLOCK)
