@@ -409,6 +409,31 @@ def _oneshot_impl():
             notify("⚠️ 未识别到语音", "请再试一次", "dialog-warning")
         return
 
+    if cfg_engine == "iflytek":
+        source = _find_mic_source()
+        if not source:
+            print("❌ 未找到麦克风")
+            return
+        if not config.get("iflytek_app_id"):
+            print("❌ 讯飞未配置，请先运行 --config")
+            return
+        if do_beep:
+            beep(880)
+        print("🎤 请说话（讯飞流式）...")
+        notify("🎤 请说话...", "讯飞流式识别", "audio-input-microphone")
+        engine = IflytekEngine()
+        text = engine.recognize_stream(source)
+        if do_beep:
+            beep(660)
+        if text:
+            print(f"📝 {text}")
+            if do_input:
+                paste_text(text)
+            notify("✅ 已输入", text[:60], "dialog-positive")
+        else:
+            notify("⚠️ 未识别到语音", "请再试一次", "dialog-warning")
+        return
+
     # Default Vosk (streaming)
     engine = VoskEngine()
     print("🎙️  加载模型...")
