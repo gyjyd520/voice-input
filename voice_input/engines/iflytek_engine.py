@@ -113,7 +113,7 @@ class IflytekEngine(BaseEngine):
         result_queue = []
 
         def on_open(ws):
-            logger.info("WebSocket opened, sending first frame")
+            logger.info("WebSocket opened")
             ws_opened.set()
 
         def on_message(ws, message):
@@ -156,13 +156,18 @@ class IflytekEngine(BaseEngine):
             on_close=on_close,
         )
 
-        ws_thread = threading.Thread(target=ws.run_forever, daemon=True)
+        # Run WebSocket in daemon thread with clean env (no proxy)
+        ws_thread = threading.Thread(
+            target=lambda: ws.run_forever(sslopt={"cert_reqs": 0}, http_proxy_host=None, http_proxy_port=None),
+            daemon=True,
+        )
         ws_thread.start()
 
-        # Wait for WebSocket to open
-        if not ws_opened.wait(timeout=5):
-            _log_error("WebSocket connection timeout")
+        # Wait for WebSocket to open (longer timeout for slow/proxied connections)
+        if not ws_opened.wait(timeout=10):
+            _log_error("WebSocket connection timeout after 10s")
             ws.close()
+            ws_thread.join(timeout=3)
             return ""
 
         if ws_error.is_set():

@@ -3,83 +3,63 @@
 import math
 import queue
 import threading
-import time
 
 import gi
 gi.require_version('Gtk', '3.0')
 gi.require_version('Gdk', '3.0')
-from gi.repository import Gtk, Gdk, GLib, cairo
+from gi.repository import Gtk, Gdk, GLib
 
 
-class LevelMeter(Gtk.DrawingArea):
-    """Cairo-drawn 5-bar audio waveform, driven by real-time RMS level."""
+class LevelMeter(Gtk.LevelBar):
+    """Audio level meter using GTK LevelBar (avoids cairo marshaling issues)."""
 
-    _BAR_COUNT = 5
-    _BAR_WIDTH = 4.5
-    _BAR_GAP = 3.5
-    _BAR_WEIGHTS = [0.5, 0.8, 1.0, 0.75, 0.55]
-    _MIN_FRACTION = 0.15
+    _HEIGHT = 28
     _ATTACK = 0.4
     _RELEASE = 0.15
-    _HEIGHT = 32
+    _PULSE_INTERVAL = 33  # ms
 
     def __init__(self):
         super().__init__()
-        total_w = self._BAR_COUNT * self._BAR_WIDTH + (self._BAR_COUNT - 1) * self._BAR_GAP
-        self.set_size_request(int(total_w), self._HEIGHT)
+        self.set_size_request(-1, self._HEIGHT)
+        self.set_min_value(0.0)
+        self.set_max_value(1.0)
         self._target = 0.0
         self._smoothed = 0.0
         self._processing = False
         self._pulse_t = 0.0
+        self._pulse_id = None
 
     def set_level(self, rms):
         self._target = min(1.0, (rms / 4000) ** 0.7)
 
     def set_processing(self, processing):
         self._processing = processing
-        if not processing:
+        if processing:
+            if not self._pulse_id:
+                self._pulse_t = 0.0
+                self._pulse_id = GLib.timeout_add(self._PULSE_INTERVAL, self._pulse_tick)
+        else:
+            if self._pulse_id:
+                GLib.source_remove(self._pulse_id)
+                self._pulse_id = None
             self._target = 0.0
-        self.queue_draw()
 
-    def do_draw(self, cr):
-        import random
-        alloc = self.get_allocation()
-        w, h = alloc.width, alloc.height
-        total_w = self._BAR_COUNT * self._BAR_WIDTH + (self._BAR_COUNT - 1) * self._BAR_GAP
-        start_x = (w - total_w) / 2
-
+    def _pulse_tick(self):
         if self._processing:
             self._pulse_t += 0.05
             level = 0.55 + 0.15 * math.sin(self._pulse_t * 2.0)
+            self.set_value(level)
+            return True
         else:
             factor = self._ATTACK if self._target > self._smoothed else self._RELEASE
             self._smoothed += (self._target - self._smoothed) * factor
-            level = self._smoothed
+            self.set_value(self._smoothed)
+            return self._smoothed > 0.01  # Stop timer when near zero
 
-        for i in range(self._BAR_COUNT):
-            weight = self._BAR_WEIGHTS[i]
-            fraction = self._MIN_FRACTION + (1 - self._MIN_FRACTION) * level * weight
-            jitter = random.uniform(-0.04, 0.04)
-            f = min(max(fraction + jitter, self._MIN_FRACTION), 1.0)
-            bar_h = h * f
-            bar_x = start_x + i * (self._BAR_WIDTH + self._BAR_GAP)
-            bar_y = (h - bar_h) / 2
-            r = self._BAR_WIDTH / 2
-
-            # White bar with slight transparency
-            cr.set_source_rgba(1, 1, 1, 0.9)
-            _rounded_rect(cr, bar_x, bar_y, self._BAR_WIDTH, bar_h, r)
-            cr.fill()
-
-
-def _rounded_rect(cr, x, y, w, h, r):
-    """Cairo path: rounded rectangle."""
-    cr.new_sub_path()
-    cr.arc(x + w - r, y + r, r, -math.pi/2, 0)
-    cr.arc(x + w - r, y + h - r, r, 0, math.pi/2)
-    cr.arc(x + r, y + h - r, r, math.pi/2, math.pi)
-    cr.arc(x + r, y + r, r, math.pi, -math.pi/2)
-    cr.close_path()
+    def stop(self):
+        if self._pulse_id:
+            GLib.source_remove(self._pulse_id)
+            self._pulse_id = None
 
 
 class OsdWindow:
@@ -193,7 +173,7 @@ class OsdWindow:
 
         outer.pack_start(header, False, False, 0)
 
-        # Level meter
+        # Level meter (GTK LevelBar, no cairo needed)
         self.level_meter = LevelMeter()
         self.level_meter.set_margin_top(10)
         self.level_meter.set_margin_bottom(8)
@@ -229,8 +209,6 @@ class OsdWindow:
 
         self.window.add(outer)
 
-        # Animation timer (30fps — smooth enough, efficient)
-        self._anim_id = GLib.timeout_add(33, self._animation_tick)
         # Message poller (20Hz)
         self._poll_id = GLib.timeout_add(50, self._poll_messages)
 
@@ -382,12 +360,6 @@ class OsdWindow:
         self.window.hide()
         self._result_event.set()
 
-    def _animation_tick(self):
-        """Redraw level meter at 30fps."""
-        if self._phase in ("recording", "processing", "refining") and self.window.get_visible():
-            self.level_meter.queue_draw()
-        return True
-
     # ====== Button callbacks (run on GTK thread) ======
 
     def _on_cancel(self, btn):
@@ -408,7 +380,6 @@ class OsdWindow:
         self._result_event.set()
 
     def _on_destroy(self, widget):
-        if self._anim_id:
-            GLib.source_remove(self._anim_id)
+        self.level_meter.stop()
         if self._poll_id:
             GLib.source_remove(self._poll_id)
