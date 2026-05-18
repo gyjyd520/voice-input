@@ -156,9 +156,15 @@ class IflytekEngine(BaseEngine):
             on_close=on_close,
         )
 
-        # Run WebSocket in daemon thread with clean env (no proxy)
+        # Run WebSocket with proxy explicitly disabled — the library falls
+        # back to https_proxy/http_proxy env vars when http_proxy_host is None.
         ws_thread = threading.Thread(
-            target=lambda: ws.run_forever(sslopt={"cert_reqs": 0}, http_proxy_host=None, http_proxy_port=None),
+            target=lambda: ws.run_forever(
+                sslopt={"cert_reqs": 0},
+                http_proxy_host=None,
+                http_proxy_port=None,
+                http_no_proxy=["*"],
+            ),
             daemon=True,
         )
         ws_thread.start()
