@@ -17,7 +17,7 @@ def get_config():
         "whisper_model": "small",
         "auto_input": True,
         "beep": True,
-        "mic_gain": 20,
+        "mic_gain": 100,
         "hotkey": "<Ctrl>space",
         "osd_enabled": True,
         "osd_timeout": 30,

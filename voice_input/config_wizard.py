@@ -98,11 +98,11 @@ def interactive_config():
         print("  ✅ 已开启 OSD")
 
     # Mic gain
-    gain = config.get("mic_gain", 20)
-    print(f"\n麦克风增益: {gain}%（默认 20，太大=削波）")
-    choice = input("设置增益 1-100 [回车跳过]: ").strip()
+    gain = config.get("mic_gain", 100)
+    print(f"\n麦克风增益: {gain}%（默认 100，USB 电容麦可设 130-200）")
+    choice = input("设置增益 1-300 [回车跳过]: ").strip()
     if choice and choice.isdigit():
-        g = max(1, min(100, int(choice)))
+        g = max(1, min(300, int(choice)))
         config["mic_gain"] = g
         src = _find_mic_source()
         if src:
