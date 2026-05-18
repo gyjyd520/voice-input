@@ -7,9 +7,11 @@ import json
 import logging
 import os
 import subprocess
+import sys
 import threading
 import time
 from datetime import datetime, timezone
+from urllib.parse import quote
 
 import websocket
 
@@ -17,6 +19,11 @@ from voice_input.config import RATE
 from voice_input.engines.base import BaseEngine
 
 logger = logging.getLogger("voice-input.iflytek")
+
+# Ensure errors are visible even without logging config
+def _log_error(msg, *args):
+    logger.error(msg, *args)
+    print(f"[iFlytek] {msg % args}", file=sys.stderr)
 
 # ── iFlytek API constants ──
 
@@ -48,7 +55,10 @@ def _build_auth_url(api_key, api_secret):
     )
     authorization = base64.b64encode(authorization_origin.encode()).decode()
 
-    return f"{IFLYTEK_URL}?authorization={authorization}&date={date}&host={IFLYTEK_HOST}"
+    return (
+        f"{IFLYTEK_URL}?authorization={quote(authorization)}"
+        f"&date={quote(date)}&host={IFLYTEK_HOST}"
+    )
 
 
 class IflytekEngine(BaseEngine):
@@ -85,7 +95,7 @@ class IflytekEngine(BaseEngine):
         api_secret = cfg.get("iflytek_api_secret", "")
 
         if not app_id or not api_key or not api_secret:
-            logger.error("iFlytek credentials not configured")
+            _log_error("iFlytek credentials not configured")
             return ""
 
         self._result_cache.clear()
@@ -111,7 +121,7 @@ class IflytekEngine(BaseEngine):
                 data = json.loads(message)
                 code = data.get("code", -1)
                 if code != 0:
-                    logger.error("iFlytek error %d: %s", code, data.get("message", ""))
+                    _log_error("iFlytek error %d: %s", code, data.get("message", ""))
                     ws_error_msg[0] = data.get("message", f"Error {code}")
                     ws_error.set()
                     return
@@ -131,7 +141,7 @@ class IflytekEngine(BaseEngine):
                 logger.exception("Error parsing iFlytek response")
 
         def on_error(ws, error):
-            logger.error("WebSocket error: %s", error)
+            _log_error("WebSocket error: %s", error)
             ws_error_msg[0] = str(error)
             ws_error.set()
 
@@ -151,12 +161,12 @@ class IflytekEngine(BaseEngine):
 
         # Wait for WebSocket to open
         if not ws_opened.wait(timeout=5):
-            logger.error("WebSocket connection timeout")
+            _log_error("WebSocket connection timeout")
             ws.close()
             return ""
 
         if ws_error.is_set():
-            logger.error("WebSocket error before recording: %s", ws_error_msg[0])
+            _log_error("WebSocket error before recording: %s", ws_error_msg[0])
             return ""
 
         # Send first frame with parameters
@@ -180,6 +190,13 @@ class IflytekEngine(BaseEngine):
         }
         ws.send(json.dumps(first_frame))
 
+        # Apply mic gain
+        try:
+            subprocess.run(["pactl", "set-source-volume", source, f"{cfg.get('mic_gain', 20)}%"],
+                          capture_output=True, timeout=3)
+        except Exception:
+            pass
+
         # Start recording
         cmd = [
             "pw-record", "--target=" + source, "--format=s16",
@@ -189,7 +206,7 @@ class IflytekEngine(BaseEngine):
         try:
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env)
         except Exception as e:
-            logger.error("Failed to start recording: %s", e)
+            _log_error("Failed to start recording: %s", e)
             ws.close()
             return ""
 
@@ -206,7 +223,7 @@ class IflytekEngine(BaseEngine):
 
                 # Check for errors
                 if ws_error.is_set():
-                    logger.error("WebSocket error: %s", ws_error_msg[0])
+                    _log_error("WebSocket error: %s", ws_error_msg[0])
                     break
 
                 raw = proc.stdout.read(CHUNK_BYTES)
@@ -236,9 +253,10 @@ class IflytekEngine(BaseEngine):
                     logger.exception("Failed to send audio frame")
                     break
 
-                # Process partial results
-                while result_queue:
-                    text = result_queue.pop()
+                # Process partial results — keep the latest
+                if result_queue:
+                    text = result_queue[-1]
+                    result_queue.clear()
 
         finally:
             proc.terminate()
@@ -264,9 +282,10 @@ class IflytekEngine(BaseEngine):
             # Wait briefly for final result
             time.sleep(0.5)
 
-            # Process remaining results
-            while result_queue:
-                text = result_queue.pop()
+            # Process remaining results — keep the latest
+            if result_queue:
+                text = result_queue[-1]
+                result_queue.clear()
 
             ws.close()
             ws_thread.join(timeout=3)
@@ -307,12 +326,18 @@ class IflytekEngine(BaseEngine):
             return self._get_accumulated()
 
     def _get_accumulated(self):
-        """Build full text from non-discarded results, ordered by sn."""
+        """Return the latest non-discarded result text.
+
+        In wpgs mode each result contains the full accumulated text up to that sn,
+        so we return the highest-sn non-discarded result's text directly.
+        """
         items = sorted(
             [(sn, item) for sn, item in self._result_cache.items() if not item["discarded"]],
             key=lambda x: x[0],
         )
-        return "".join(item["text"] for _, item in items)
+        if not items:
+            return ""
+        return items[-1][1]["text"]
 
     # ── Helpers ──
 

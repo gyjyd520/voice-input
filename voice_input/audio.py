@@ -86,12 +86,16 @@ def _find_mic_source():
 def _test_mic(m):
     """Quick test if mic has real audio signal. Returns RMS or -1."""
     try:
-        p = subprocess.run(
-            ["pw-record", "--target=" + m, "--format=s16",
-             "--channels=1", "--rate=16000", "-"],
-            capture_output=True, timeout=1.5, env={**os.environ,
-            "PIPEWIRE_DEBUG": "0", "JACK_NO_START_SERVER": "1"})
-        raw = p.stdout
+        try:
+            p = subprocess.run(
+                ["pw-record", "--target=" + m, "--format=s16",
+                 "--channels=1", "--rate=16000", "-"],
+                capture_output=True, timeout=1.5, env={**os.environ,
+                "PIPEWIRE_DEBUG": "0", "JACK_NO_START_SERVER": "1"})
+            raw = p.stdout
+        except subprocess.TimeoutExpired as e:
+            # pw-record streams forever; capture what we got before timeout
+            raw = e.stdout or b""
         if len(raw) > 3200:
             vals = struct.unpack("<" + str(len(raw)//2) + "h",
                                 raw[:len(raw)//2*2])
