@@ -1,6 +1,13 @@
 """OpenAI Whisper engine."""
 
+import re
+
 from voice_input.notify import notify
+
+_HALLUCINATION_PATTERNS = [
+    re.compile(r"字幕\s*by\s*索兰娅", re.I),
+    re.compile(r"字幕\s*by\s*[a-z]+", re.I),
+]
 
 
 class WhisperEngine:
@@ -29,5 +36,11 @@ class WhisperEngine:
             return ""
         result = self.model.transcribe(
             wav_path, language="zh",
-            initial_prompt="以下是简体中文普通话的句子。")
-        return result["text"].strip()
+            no_speech_threshold=0.6,
+            logprob_threshold=-1.0,
+            compression_ratio_threshold=2.4,
+        )
+        text = result["text"].strip()
+        for pat in _HALLUCINATION_PATTERNS:
+            text = pat.sub("", text)
+        return text.strip()

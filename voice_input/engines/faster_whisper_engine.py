@@ -1,10 +1,18 @@
 """Faster-Whisper engine — CTranslate2 backend, ~4x faster on CPU."""
 
 import os
+import re
 
 from voice_input.notify import notify
 
 FASTER_WHISPER_MODEL_DIR = os.path.expanduser("~/.local/share/faster-whisper/models")
+
+# Known hallucination patterns on non-speech/noise input
+_HALLUCINATION_PATTERNS = [
+    re.compile(r"字幕\s*by\s*索兰娅", re.I),
+    re.compile(r"字幕\s*by\s*[a-z]+", re.I),
+    re.compile(r"^[\s,.，。！？!?]+$"),  # punctuation-only
+]
 
 
 class FasterWhisperEngine:
@@ -40,7 +48,24 @@ class FasterWhisperEngine:
     def transcribe(self, wav_path):
         if not self.model:
             return ""
-        segments, _ = self.model.transcribe(
+        segments, info = self.model.transcribe(
             wav_path, language="zh", beam_size=5,
-            initial_prompt="以下是简体中文普通话的句子：")
-        return "".join(seg.text for seg in segments).strip()
+            vad_filter=True,
+            vad_parameters=dict(
+                threshold=0.5,
+                min_speech_duration_ms=250,
+                min_silence_duration_ms=300,
+            ),
+        )
+        # If VAD found no speech, return empty
+        if getattr(info, 'duration_after_vad', 1.0) <= 0.01:
+            return ""
+        text = "".join(seg.text for seg in segments).strip()
+        return _filter_hallucination(text)
+
+
+def _filter_hallucination(text):
+    """Remove known hallucination patterns from model output."""
+    for pat in _HALLUCINATION_PATTERNS:
+        text = pat.sub("", text)
+    return text.strip()
