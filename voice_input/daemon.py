@@ -9,7 +9,7 @@ from voice_input.config import get_config
 from voice_input.audio import _find_mic_source, _apply_mic_gain, beep, record_audio_batch, record_recognize
 from voice_input.input import paste_text, clip
 from voice_input.notify import notify
-from voice_input.engines import VoskEngine, WhisperEngine, FasterWhisperEngine, GoogleEngine
+from voice_input.engines import VoskEngine, WhisperEngine, FasterWhisperEngine, GoogleEngine, IflytekEngine
 
 
 class VoiceDaemon:
@@ -246,6 +246,23 @@ class VoiceDaemon:
                     return
             text = self.whisper_engine.transcribe(wav_path)
             os.unlink(wav_path)
+        elif engine_name == "iflytek":
+            # iFlytek streaming — engine manages recording + recognition
+            cfg = get_config()
+            if not cfg.get("iflytek_app_id"):
+                notify("❌ 讯飞未配置", "请先配置 APPID/APIKey/APISecret", "dialog-error")
+                if osd:
+                    osd.show_error("讯飞未配置")
+                return
+            engine = IflytekEngine()
+            text = engine.recognize_stream(
+                source,
+                on_partial=_on_partial,
+                on_level=_on_level,
+                stop_fn=stop_fn,
+            )
+            if do_beep:
+                beep(660)
         else:
             # vosk streaming
             self.vosk_engine.reset()

@@ -26,6 +26,14 @@ def get_config():
         "llm_api_base_url": "https://api.openai.com/v1",
         "llm_api_key": "",
         "llm_model": "gpt-4o-mini",
+        "iflytek_app_id": "",
+        "iflytek_api_key": "",
+        "iflytek_api_secret": "",
+        "iflytek_language": "zh_cn",
+        "iflytek_accent": "mandarin",
+        "iflytek_vad_eos": 3000,
+        "iflytek_ptt": 1,
+        "iflytek_nunum": 1,
     }
     if CONFIG_FILE.exists():
         try:

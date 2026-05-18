@@ -4,6 +4,7 @@ from voice_input.engines.vosk_engine import VoskEngine
 from voice_input.engines.whisper_engine import WhisperEngine
 from voice_input.engines.faster_whisper_engine import FasterWhisperEngine
 from voice_input.engines.google_engine import GoogleEngine
+from voice_input.engines.iflytek_engine import IflytekEngine
 
 
 def get_engine_class(name):
@@ -13,5 +14,6 @@ def get_engine_class(name):
         "whisper": WhisperEngine,
         "faster-whisper": FasterWhisperEngine,
         "google": GoogleEngine,
+        "iflytek": IflytekEngine,
     }
     return engines.get(name)

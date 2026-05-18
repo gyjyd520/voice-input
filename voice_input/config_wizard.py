@@ -14,19 +14,43 @@ def interactive_config():
     print("=" * 40)
 
     # Engine selection
-    engines = {"1": "vosk", "2": "google", "3": "whisper", "4": "faster-whisper"}
+    engines = {"1": "vosk", "2": "google", "3": "whisper", "4": "faster-whisper", "5": "iflytek"}
     engine_names = {"vosk": "Vosk（本地流式）", "google": "Google（在线）",
-                    "whisper": "Whisper（本地离线）", "faster-whisper": "Faster-Whisper（本地，CPU快4x）"}
+                    "whisper": "Whisper（本地离线）", "faster-whisper": "Faster-Whisper（本地，CPU快4x）",
+                    "iflytek": "讯飞（在线流式，中英文混合最佳）"}
     current = config.get("engine", "vosk")
     print(f"\n当前引擎: {engine_names.get(current, current)}")
     print("  1) Vosk — 本地流式实时识别")
-    print("  2) Google — 在线 Web Speech API（推荐）")
+    print("  2) Google — 在线 Web Speech API")
     print("  3) Whisper — 本地离线 OpenAI Whisper")
     print("  4) Faster-Whisper — 本地 faster-whisper 服务器")
-    choice = input("选择引擎 [1/2/3/4，回车跳过]: ").strip()
+    print("  5) 讯飞 — 在线流式，中英文混合最佳（需配置）")
+    choice = input("选择引擎 [1-5，回车跳过]: ").strip()
     if choice in engines:
         config["engine"] = engines[choice]
         print(f"  ✅ 已设为 {engine_names[engines[choice]]}")
+
+    # iFlytek config
+    if config.get("engine") == "iflytek":
+        print("\n📡 讯飞语音听写配置（从 console.xfyun.cn 语音听写服务获取）")
+
+        current_appid = config.get("iflytek_app_id", "")
+        print(f"当前 APPID: {current_appid[:6]}***" if len(current_appid) > 6 else f"当前 APPID: {current_appid or '(空)'}")
+        choice = input("APPID [回车跳过]: ").strip()
+        if choice:
+            config["iflytek_app_id"] = choice
+
+        current_apikey = config.get("iflytek_api_key", "")
+        print(f"当前 APIKey: {current_apikey[:6]}***" if len(current_apikey) > 6 else f"当前 APIKey: {current_apikey or '(空)'}")
+        choice = input("APIKey（32位）[回车跳过]: ").strip()
+        if choice:
+            config["iflytek_api_key"] = choice
+
+        current_secret = config.get("iflytek_api_secret", "")
+        print(f"当前 APISecret: {'***' if current_secret else '(空)'}")
+        choice = input("APISecret（32位）[回车跳过]: ").strip()
+        if choice:
+            config["iflytek_api_secret"] = choice
 
     # Whisper model
     if config.get("engine") in ("whisper", "faster-whisper"):
