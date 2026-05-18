@@ -70,7 +70,7 @@ class IflytekEngine(BaseEngine):
 
     def __init__(self):
         self._result_lock = threading.Lock()
-        self._result_cache = {}  # sn -> {"text": str, "discarded": bool}
+        self._result_cache = {}  # sn -> text (full text for rpl, delta for apd)
         self._has_ended = False
 
     # ── Public API ──
@@ -253,10 +253,11 @@ class IflytekEngine(BaseEngine):
                     logger.exception("Failed to send audio frame")
                     break
 
-                # Process partial results — keep the latest
+                # Swap queue to avoid race with WebSocket thread
                 if result_queue:
-                    text = result_queue[-1]
-                    result_queue.clear()
+                    snapshot = result_queue
+                    result_queue = []
+                    text = snapshot[-1]
 
         finally:
             proc.terminate()
@@ -282,10 +283,11 @@ class IflytekEngine(BaseEngine):
             # Wait briefly for final result
             time.sleep(0.5)
 
-            # Process remaining results — keep the latest
+            # Swap queue to avoid race with WebSocket thread
             if result_queue:
-                text = result_queue[-1]
-                result_queue.clear()
+                snapshot = result_queue
+                result_queue = []
+                text = snapshot[-1]
 
             ws.close()
             ws_thread.join(timeout=3)
@@ -298,9 +300,13 @@ class IflytekEngine(BaseEngine):
     def _process_result(self, result):
         """Process a single iFlytek result with dynamic correction (wpgs).
 
+        In wpgs mode:
+        - pgs=apd: text is a delta (new text to append)
+        - pgs=rpl: text is full replacement for range rg — supersedes all
+          intermediate results between rg[0] and sn
+
         Returns the full accumulated text after applying this result.
         """
-        # Extract text from word list
         ws_list = result.get("ws", [])
         text = ""
         for w in ws_list:
@@ -312,32 +318,29 @@ class IflytekEngine(BaseEngine):
 
         with self._result_lock:
             if pgs == "rpl":
-                # Replace: discard results in range [rg[0], rg[1]]
+                # Full text replacement: clear replaced range + all
+                # intermediate rpl results between rg[0] and sn
                 rg = result.get("rg", [sn, sn])
-                for i in range(rg[0], rg[1] + 1):
-                    if i in self._result_cache:
-                        self._result_cache[i]["discarded"] = True
-                self._result_cache[sn] = {"text": text, "discarded": False}
-            else:
-                # apd or no pgs: append
-                self._result_cache[sn] = {"text": text, "discarded": False}
+                for i in range(rg[0], sn):
+                    self._result_cache.pop(i, None)
+            self._result_cache[sn] = text
 
-            # Build accumulated text
             return self._get_accumulated()
 
     def _get_accumulated(self):
-        """Return the latest non-discarded result text.
+        """Build accumulated text from cached results.
 
-        In wpgs mode each result contains the full accumulated text up to that sn,
-        so we return the highest-sn non-discarded result's text directly.
+        Uses the last rpl result as the full-text base, then appends any
+        apd deltas that come after it. When no rpl results exist (plain
+        mode), concatenates all results in order.
         """
-        items = sorted(
-            [(sn, item) for sn, item in self._result_cache.items() if not item["discarded"]],
-            key=lambda x: x[0],
-        )
+        items = sorted(self._result_cache.items(), key=lambda x: x[0])
         if not items:
             return ""
-        return items[-1][1]["text"]
+
+        # After rpl clearing, only one rpl result (full-text base)
+        # remains plus any apd deltas after it. Concatenate in order.
+        return "".join(item for _, item in items)
 
     # ── Helpers ──
 
