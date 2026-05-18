@@ -22,6 +22,10 @@ def get_config():
         "osd_enabled": True,
         "osd_timeout": 30,
         "auto_confirm": False,
+        "llm_enabled": False,
+        "llm_api_base_url": "https://api.openai.com/v1",
+        "llm_api_key": "",
+        "llm_model": "gpt-4o-mini",
     }
     if CONFIG_FILE.exists():
         try:

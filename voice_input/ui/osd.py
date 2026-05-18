@@ -12,67 +12,64 @@ from gi.repository import Gtk, Gdk, GLib, cairo
 
 
 class LevelMeter(Gtk.DrawingArea):
-    """Cairo-drawn audio level bar with smooth animation."""
+    """Cairo-drawn 5-bar audio waveform, driven by real-time RMS level."""
+
+    _BAR_COUNT = 5
+    _BAR_WIDTH = 4.5
+    _BAR_GAP = 3.5
+    _BAR_WEIGHTS = [0.5, 0.8, 1.0, 0.75, 0.55]
+    _MIN_FRACTION = 0.15
+    _ATTACK = 0.4
+    _RELEASE = 0.15
+    _HEIGHT = 32
 
     def __init__(self):
         super().__init__()
-        self.set_size_request(-1, 6)
-        self._level = 0.0
+        total_w = self._BAR_COUNT * self._BAR_WIDTH + (self._BAR_COUNT - 1) * self._BAR_GAP
+        self.set_size_request(int(total_w), self._HEIGHT)
         self._target = 0.0
+        self._smoothed = 0.0
         self._processing = False
+        self._pulse_t = 0.0
 
     def set_level(self, rms):
-        """Set target level from RMS value (0-8000+)."""
         self._target = min(1.0, (rms / 4000) ** 0.7)
 
     def set_processing(self, processing):
         self._processing = processing
+        if not processing:
+            self._target = 0.0
         self.queue_draw()
 
     def do_draw(self, cr):
+        import random
         alloc = self.get_allocation()
         w, h = alloc.width, alloc.height
-        r = min(3, h / 2)
+        total_w = self._BAR_COUNT * self._BAR_WIDTH + (self._BAR_COUNT - 1) * self._BAR_GAP
+        start_x = (w - total_w) / 2
 
-        # Smooth interpolation
         if self._processing:
-            self._level = 0.7
+            self._pulse_t += 0.05
+            level = 0.55 + 0.15 * math.sin(self._pulse_t * 2.0)
         else:
-            self._level += (self._target - self._level) * 0.25
+            factor = self._ATTACK if self._target > self._smoothed else self._RELEASE
+            self._smoothed += (self._target - self._smoothed) * factor
+            level = self._smoothed
 
-        # Background track
-        cr.set_source_rgba(1, 1, 1, 0.1)
-        _rounded_rect(cr, 0, 0, w, h, r)
-        cr.fill()
+        for i in range(self._BAR_COUNT):
+            weight = self._BAR_WEIGHTS[i]
+            fraction = self._MIN_FRACTION + (1 - self._MIN_FRACTION) * level * weight
+            jitter = random.uniform(-0.04, 0.04)
+            f = min(max(fraction + jitter, self._MIN_FRACTION), 1.0)
+            bar_h = h * f
+            bar_x = start_x + i * (self._BAR_WIDTH + self._BAR_GAP)
+            bar_y = (h - bar_h) / 2
+            r = self._BAR_WIDTH / 2
 
-        # Active level
-        if self._processing:
-            # Animated sweep for processing state
-            offset = (time.time() * 1.2) % 1.0
-            pat = cairo.LinearGradient(0, 0, w, 0)
-            pat.add_color_stop_rgba(0, 0.25, 0.55, 1.0, 0.85)
-            pat.add_color_stop_rgba(max(0, offset - 0.15), 0.25, 0.55, 1.0, 0.3)
-            pat.add_color_stop_rgba(offset, 0.3, 0.65, 1.0, 0.9)
-            pat.add_color_stop_rgba(min(1, offset + 0.15), 0.25, 0.55, 1.0, 0.3)
-            pat.add_color_stop_rgba(1, 0.25, 0.55, 1.0, 0.85)
-            cr.set_source(pat)
-            _rounded_rect(cr, 0, 0, w, h, r)
+            # White bar with slight transparency
+            cr.set_source_rgba(1, 1, 1, 0.9)
+            _rounded_rect(cr, bar_x, bar_y, self._BAR_WIDTH, bar_h, r)
             cr.fill()
-        else:
-            level_w = max(r * 2, w * self._level)
-            pat = cairo.LinearGradient(0, 0, level_w, 0)
-            pat.add_color_stop_rgba(0, 0.15, 0.75, 0.36, 0.9)
-            pat.add_color_stop_rgba(0.55, 0.7, 0.78, 0.18, 0.9)
-            pat.add_color_stop_rgba(1, 0.92, 0.28, 0.2, 0.9)
-            cr.set_source(pat)
-            _rounded_rect(cr, 0, 0, level_w, h, r)
-            cr.fill()
-
-        # Border
-        cr.set_source_rgba(1, 1, 1, 0.12)
-        _rounded_rect(cr, 0, 0, w, h, r)
-        cr.set_line_width(0.5)
-        cr.stroke()
 
 
 def _rounded_rect(cr, x, y, w, h, r):
@@ -279,6 +276,9 @@ class OsdWindow:
     def show_processing(self):
         self._msg_queue.put(('show_processing', None))
 
+    def show_refining(self):
+        self._msg_queue.put(('show_refining', None))
+
     def show_result(self, text, timeout=30):
         """Show recognized text and wait for user action.
         Returns 'confirm', 'edit', 'discard', or 'timeout'."""
@@ -336,6 +336,13 @@ class OsdWindow:
         self.level_meter.set_processing(True)
         self.cancel_btn.hide()
 
+    def _handle_show_refining(self, _):
+        self._phase = "refining"
+        self.status_label.set_text("🔍 正在优化...")
+        self.level_meter.set_processing(True)
+        self.cancel_btn.hide()
+        self.action_box.hide()
+
     def _handle_show_result(self, text):
         self._phase = "review"
         self.status_label.set_text("✓ 识别完成")
@@ -377,7 +384,7 @@ class OsdWindow:
 
     def _animation_tick(self):
         """Redraw level meter at 30fps."""
-        if self._phase in ("recording", "processing") and self.window.get_visible():
+        if self._phase in ("recording", "processing", "refining") and self.window.get_visible():
             self.level_meter.queue_draw()
         return True
 

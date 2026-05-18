@@ -254,6 +254,20 @@ class VoiceDaemon:
             if do_beep:
                 beep(660)
 
+        # LLM refinement (if enabled)
+        cfg = get_config()
+        if text and cfg.get("llm_enabled") and cfg.get("llm_api_key"):
+            if osd:
+                osd.show_refining()
+            try:
+                from voice_input.llm_refiner import LLMRefiner
+                refiner = LLMRefiner()
+                refined = refiner.refine(text)
+                if refined:
+                    text = refined
+            except Exception:
+                pass  # Fall back to original ASR text
+
         # Post-recognition handling
         if text:
             if osd:
