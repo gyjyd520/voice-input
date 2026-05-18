@@ -69,8 +69,8 @@ def _find_mic_source():
             # Level check for Bluetooth and USB
             if "bluez_input" in m or "usb" in m.lower():
                 rms = _test_mic(m)
-                if rms < 200:
-                    continue  # Silent or disconnected
+                if rms < 30:
+                    continue  # Disconnected or completely silent
 
             _mic_source_cache = m
             return m
