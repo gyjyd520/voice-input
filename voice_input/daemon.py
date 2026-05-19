@@ -173,6 +173,7 @@ class VoiceDaemon:
 
         if do_beep:
             beep(880)
+            time.sleep(0.2)  # Let beep finish before mic opens
         source = _find_mic_source()
         if not source:
             notify("❌ 未找到麦克风", "", "dialog-error")

@@ -36,10 +36,25 @@ CHUNK_BYTES = 1280
 CHUNK_INTERVAL = 0.04
 
 
+# English day/month abbreviations for locale-independent date formatting.
+# strftime(%a/%b) produces Chinese characters under zh_CN.UTF-8, which
+# breaks iFlytek's HMAC signature verification.
+_EN_WEEKDAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+_EN_MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+
+
 def _build_auth_url(api_key, api_secret):
     """Build the authenticated WebSocket URL with HMAC-SHA256 signature."""
     now = datetime.now(timezone.utc)
-    date = now.strftime("%a, %d %b %Y %H:%M:%S GMT")
+    date = "%s, %02d %s %d %02d:%02d:%02d GMT" % (
+        _EN_WEEKDAYS[now.weekday()],
+        now.day,
+        _EN_MONTHS[now.month - 1],
+        now.year,
+        now.hour,
+        now.minute,
+        now.second,
+    )
 
     signature_origin = f"host: {IFLYTEK_HOST}\ndate: {date}\nGET {IFLYTEK_PATH} HTTP/1.1"
     signature_sha = hmac.new(
@@ -70,8 +85,9 @@ class IflytekEngine(BaseEngine):
 
     def __init__(self):
         self._result_lock = threading.Lock()
-        self._result_cache = {}  # sn -> text (full text for rpl, delta for apd)
+        self._result_cache = {}  # sn -> (type, text) where type is 'rpl' or 'apd'
         self._has_ended = False
+        self._debug = False
 
     # ── Public API ──
 
@@ -101,6 +117,41 @@ class IflytekEngine(BaseEngine):
         self._result_cache.clear()
         self._has_ended = False
 
+        # ── Start recording BEFORE WebSocket so audio is ready ──
+        # Apply mic gain
+        try:
+            subprocess.run(["pactl", "set-source-volume", source, f"{cfg.get('mic_gain', 20)}%"],
+                          capture_output=True, timeout=3)
+        except Exception:
+            pass
+
+        cmd = [
+            "pw-record", "--target=" + source, "--format=s16",
+            "--channels=1", "--rate=" + str(RATE), "-",
+        ]
+        env = {**os.environ, "PIPEWIRE_DEBUG": "0", "JACK_NO_START_SERVER": "1"}
+        try:
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env)
+        except Exception as e:
+            _log_error("Failed to start recording: %s", e)
+            return ""
+
+        # Pre-buffer a small amount of audio while connecting — just enough
+        # to ensure the server has audio immediately after the first frame.
+        pre_buffer = []
+        pre_start = time.time()
+        while time.time() - pre_start < 3.0:
+            raw = proc.stdout.read(CHUNK_BYTES)
+            if raw:
+                pre_buffer.append(raw)
+                if len(pre_buffer) >= 5:  # 200ms — enough to keep session alive
+                    break
+            else:
+                time.sleep(0.005)
+
+        if self._debug:
+            print(f"[audio] pre_buffer={len(pre_buffer)} chunks", file=sys.stderr)
+
         # Build auth URL
         url = _build_auth_url(api_key, api_secret)
         logger.info("Connecting to iFlytek...")
@@ -120,6 +171,13 @@ class IflytekEngine(BaseEngine):
             try:
                 data = json.loads(message)
                 code = data.get("code", -1)
+
+                if self._debug:
+                    status = data.get("data", {}).get("status", "?")
+                    has_result = "result" in (data.get("data", {}) or {})
+                    msg_preview = message if len(message) < 300 else message[:200] + "..."
+                    print(f"\n[iFlytek MSG] code={code} status={status} has_result={has_result} body={msg_preview}", file=sys.stderr)
+
                 if code != 0:
                     _log_error("iFlytek error %d: %s", code, data.get("message", ""))
                     ws_error_msg[0] = data.get("message", f"Error {code}")
@@ -174,10 +232,12 @@ class IflytekEngine(BaseEngine):
             _log_error("WebSocket connection timeout after 10s")
             ws.close()
             ws_thread.join(timeout=3)
+            proc.terminate()
             return ""
 
         if ws_error.is_set():
             _log_error("WebSocket error before recording: %s", ws_error_msg[0])
+            proc.terminate()
             return ""
 
         # Send first frame with parameters
@@ -201,29 +261,29 @@ class IflytekEngine(BaseEngine):
         }
         ws.send(json.dumps(first_frame))
 
-        # Apply mic gain
-        try:
-            subprocess.run(["pactl", "set-source-volume", source, f"{cfg.get('mic_gain', 20)}%"],
-                          capture_output=True, timeout=3)
-        except Exception:
-            pass
-
-        # Start recording
-        cmd = [
-            "pw-record", "--target=" + source, "--format=s16",
-            "--channels=1", "--rate=" + str(RATE), "-",
-        ]
-        env = {**os.environ, "PIPEWIRE_DEBUG": "0", "JACK_NO_START_SERVER": "1"}
-        try:
-            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env)
-        except Exception as e:
-            _log_error("Failed to start recording: %s", e)
-            ws.close()
-            return ""
-
         start = time.time()
         last_level_time = 0
         text = ""
+        chunk_count = 0
+        sent_count = 0
+
+        # Flush pre-buffered audio — beep is long over, no skip needed
+        for raw in pre_buffer:
+            chunk_count += 1
+            sent_count += 1
+            audio_b64 = base64.b64encode(raw).decode()
+            frame = {
+                "data": {
+                    "status": 1,
+                    "format": "audio/L16;rate=16000",
+                    "encoding": "raw",
+                    "audio": audio_b64,
+                }
+            }
+            try:
+                ws.send(json.dumps(frame))
+            except Exception:
+                break
 
         try:
             while not self._has_ended and (time.time() - start) < 60:
@@ -242,13 +302,19 @@ class IflytekEngine(BaseEngine):
                     time.sleep(0.01)
                     continue
 
+                chunk_count += 1
+                # Skip first 5 chunks (~200ms) to avoid capturing beep tail
+                if chunk_count <= 5:
+                    continue
+
                 # Audio level (RMS)
+                rms = self._calc_rms(raw)
                 if on_level and (time.time() - last_level_time) > 0.05:
-                    rms = self._calc_rms(raw)
                     on_level(rms)
                     last_level_time = time.time()
 
                 # Send base64-encoded chunk
+                sent_count += 1
                 audio_b64 = base64.b64encode(raw).decode()
                 frame = {
                     "data": {
@@ -271,6 +337,12 @@ class IflytekEngine(BaseEngine):
                     text = snapshot[-1]
 
         finally:
+            # Log audio stats before cleanup
+            if self._debug:
+                audio_ms = (chunk_count * CHUNK_BYTES) // (16000 * 2) * 1000
+                print(f"\n[audio] total_chunks={chunk_count} skipped=5 sent={sent_count} "
+                      f"audio_ms={audio_ms} duration_s={time.time()-start:.1f}", file=sys.stderr)
+
             proc.terminate()
             try:
                 proc.wait(timeout=2)
@@ -303,8 +375,18 @@ class IflytekEngine(BaseEngine):
             ws.close()
             ws_thread.join(timeout=3)
 
+        # Clean up: collapse whitespace, strip noise chars from edges
+        text = text.strip() if text else ""
+        if text:
+            import re
+            # Strip leading/trailing non-word noise (bare consonants like "v")
+            # that come from audio artifacts (beep, buzz, click).
+            text = re.sub(r'^[\s*v]+', '', text)
+            text = re.sub(r'[\s*v]+$', '', text)
+            text = text.strip()
+
         logger.info("Final text: %r", text)
-        return text.strip() if text else ""
+        return text
 
     # ── Result processing (dynamic correction) ──
 
@@ -326,32 +408,60 @@ class IflytekEngine(BaseEngine):
 
         sn = result.get("sn", 0)
         pgs = result.get("pgs", "")
+        rg = result.get("rg", [sn, sn])
+        ls = result.get("ls", False)
+
+        # When pgs is empty (non-wpgs mode or initial result), the text is
+        # the full accumulated text — treat as rpl to avoid concatenation dupes.
+        if not pgs or pgs not in ("rpl", "apd"):
+            pgs = "rpl"
+
+        if self._debug:
+            print(f"[wpgs] sn={sn} pgs={pgs} rg={rg} ls={ls} text={text!r}", file=sys.stderr)
 
         with self._result_lock:
-            if pgs == "rpl":
-                # Full text replacement: clear replaced range + all
-                # intermediate rpl results between rg[0] and sn
-                rg = result.get("rg", [sn, sn])
-                for i in range(rg[0], sn):
-                    self._result_cache.pop(i, None)
-            self._result_cache[sn] = text
+            for i in range(rg[0], sn):
+                self._result_cache.pop(i, None)
+            self._result_cache[sn] = (pgs, text)
 
-            return self._get_accumulated()
+            accumulated = self._get_accumulated()
+            if self._debug:
+                print(f"[wpgs] cache={dict(self._result_cache)!r} accumulated={accumulated!r}", file=sys.stderr)
+            return accumulated
 
     def _get_accumulated(self):
         """Build accumulated text from cached results.
 
-        Uses the last rpl result as the full-text base, then appends any
-        apd deltas that come after it. When no rpl results exist (plain
-        mode), concatenates all results in order.
+        In wpgs mode, results are stored as (pgs, text):
+        - rpl with rg[0]==0: full text from the beginning — it IS the base.
+          Later rpl entries in [0, sn) are removed by _process_result, so
+          only the latest rpl that starts at 0 survives.
+        - rpl with rg[0]>0: replaces only a suffix range. Text before rg[0]
+          is preserved from earlier (lower-sn) entries.
+        - apd: delta to append after everything.
+
+        Strategy: iterate in sn order. rpl entries reset the result, apd
+        entries append. This works because _process_result already removed
+        entries in the replaced range [rg[0], sn), so the remaining rpls
+        represent non-overlapping segments.
         """
         items = sorted(self._result_cache.items(), key=lambda x: x[0])
         if not items:
             return ""
 
-        # After rpl clearing, only one rpl result (full-text base)
-        # remains plus any apd deltas after it. Concatenate in order.
-        return "".join(item for _, item in items)
+        result = ""
+        for _sn, (_pgs, text) in items:
+            if _pgs == "rpl":
+                # rpl is full text for its segment. If it starts at 0, it's
+                # the base; if not, previous segments + this one form the text.
+                # Since _process_result already cleared the replaced range,
+                # each surviving rpl represents a non-overlapping segment.
+                # Simply concatenating handles both cases correctly.
+                result += text
+            else:
+                # apd — delta, always append
+                result += text
+        return result
 
     # ── Helpers ──
 

@@ -90,22 +90,21 @@ class OsdWindow:
         self.window.set_size_request(400, -1)
         self.window.connect("destroy", self._on_destroy)
 
-        # CSS styling
+        # Override theme backgrounds directly (bypass CSS cascade which Yaru overrides)
+        dark_bg = Gdk.RGBA()
+        dark_bg.parse("#1e1e24")
+        self.window.override_background_color(Gtk.StateFlags.NORMAL, dark_bg)
+
+        # CSS for text, buttons, levelbar (these work reliably)
         css = Gtk.CssProvider()
         css.load_from_data(b"""
-            window {
-                background-color: rgba(24, 24, 28, 0.92);
-                border-radius: 14px;
-                border: 1px solid rgba(255, 255, 255, 0.10);
-                box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
-            }
             label {
-                color: rgba(255, 255, 255, 0.90);
+                color: rgba(255, 255, 255, 0.95);
                 font-family: "Noto Sans CJK SC", "Noto Sans", sans-serif;
             }
             .status-label {
                 font-size: 13px;
-                font-weight: 500;
+                font-weight: 600;
             }
             .text-label {
                 font-size: 16px;
@@ -124,7 +123,6 @@ class OsdWindow:
                 border: none;
                 border-radius: 8px;
                 padding: 8px 20px;
-                transition: all 150ms ease;
             }
             button:hover {
                 background: rgba(255, 255, 255, 0.16);
@@ -147,16 +145,37 @@ class OsdWindow:
                 color: rgba(255, 255, 255, 0.8);
                 background: rgba(255, 255, 255, 0.06);
             }
+            levelbar block.filled {
+                background: rgba(82, 180, 255, 0.90);
+                border-radius: 2px;
+            }
+            levelbar block.empty {
+                background: rgba(255, 255, 255, 0.08);
+                border-radius: 2px;
+            }
         """)
         style_ctx = self.window.get_style_context()
-        style_ctx.add_provider(css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+        style_ctx.add_provider(css, Gtk.STYLE_PROVIDER_PRIORITY_USER)
+
+        # Root vertical box
+        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        self.window.add(root)
+
+        # Blue accent bar at top (3px, direct color — no CSS needed)
+        accent = Gtk.EventBox()
+        blue_accent = Gdk.RGBA()
+        blue_accent.parse("#5294ff")
+        accent.override_background_color(Gtk.StateFlags.NORMAL, blue_accent)
+        accent.set_size_request(-1, 3)
+        root.pack_start(accent, False, False, 0)
 
         # Main layout
         outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
-        outer.set_margin_top(14)
-        outer.set_margin_bottom(14)
+        outer.set_margin_top(12)
+        outer.set_margin_bottom(12)
         outer.set_margin_start(18)
         outer.set_margin_end(18)
+        root.pack_start(outer, False, False, 0)
 
         # Header: status + cancel
         header = Gtk.Box(spacing=8)
@@ -206,8 +225,6 @@ class OsdWindow:
         self.action_box.pack_start(self.confirm_btn, True, True, 0)
 
         outer.pack_start(self.action_box, False, False, 0)
-
-        self.window.add(outer)
 
         # Message poller (20Hz)
         self._poll_id = GLib.timeout_add(50, self._poll_messages)

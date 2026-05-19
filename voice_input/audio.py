@@ -126,7 +126,7 @@ def _calc_rms(frame):
     return int((sum(v*v for v in vals) / count) ** 0.5)
 
 
-def beep(freq=800, dur=0.08):
+def beep(freq=800, dur=0.06):
     """Play short beep via pw-play."""
     try:
         n = int(RATE * dur)
@@ -134,7 +134,7 @@ def beep(freq=800, dur=0.08):
         fade = np.ones(n)
         fade[:n//10] = np.linspace(0, 1, n//10)
         fade[-n//10:] = np.linspace(1, 0, n//10)
-        s = (np.sin(2*np.pi*freq*t) * 0.3 * fade).astype(np.float32)
+        s = (np.sin(2*np.pi*freq*t) * 0.18 * fade).astype(np.float32)
         data = (s*32767).astype(np.int16).tobytes()
 
         # Generate WAV header
